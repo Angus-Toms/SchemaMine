@@ -36,6 +36,8 @@ private:
     std::string csvPath;
     int attributeCount;
     int tupleCount;
+    std::hash<std::string> strHasher;
+    std::hash<int> intHasher;
 
     // Entropy info
     std::map<AttributeSet, double> entropies;
@@ -189,7 +191,6 @@ public:
     void computeEntropiesTIDCNT() {
         getFirstLevelEntropies();
         
-        auto start = std::chrono::high_resolution_clock::now();
         std::queue<std::pair<AttributeSet, int>> q;
         for (int i = 0; i < attributeCount; i++) {
             q.push({{i}, i});
@@ -211,9 +212,6 @@ public:
                 }
             }
         }
-        auto end = std::chrono::high_resolution_clock::now();
-        auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
-        std::cout << "Time taken: " << duration.count() << "ms\n";
     }
 
     bool isCombinationCommon(std::vector<int> columns, std::vector<std::string> values) {
@@ -228,99 +226,66 @@ public:
         return conn.Query(query)->GetValue(0, 0).GetValue<int>() > 1;
     }
 
-    // Function to calculate the sum of count * log2(count) for a given combination
-    double calculateSumCntLog2(const std::string& inputRelation, const AttributeSet& groupByCols) {
-        // Create the SQL GROUP BY clause dynamically from the AttributeSet
-        std::string groupByClause = "";
-        for (auto it = groupByCols.begin(); it != groupByCols.end(); ++it) {
-            if (it != groupByCols.begin()) groupByClause += ", ";
-            groupByClause += "col" + std::to_string(*it + 1);  // col1, col2, ...
-        }
+    void runBUC(const std::string& tblName, AttributeSet attSet) {
+        // Iterate through possible partitionAtts remaining 
+        int prevPartitionAtt = attSet.empty() ? -1 : *attSet.rbegin(); 
 
-        // Query to calculate SUM(COUNT(*) * LOG2(COUNT(*))) for the given group-by columns
-        auto result = conn.Query("SELECT SUM(cnt) FROM ("
-                                 "SELECT COUNT(*) * LOG2(COUNT(*)) AS cnt FROM " + inputRelation +
-                                 " GROUP BY " + groupByClause + " HAVING COUNT(*) > 1) AS t;");
-        if (result->RowCount() == 0) {
-            return 0.0;  // No valid rows
-        }
-        return result->GetValue(0, 0).GetValue<double>();
-    }
-
-    // Recursive BUC function to partition and calculate entropies
-    void runBUC(const std::string& inputRelation, int dim, const AttributeSet& combination) {
-        std::string temp = "TEMP_" + std::to_string(dim);
-
-        // Iterate through remaining attributes
-        for (int d = dim; d < attributeCount; ++d) {
-            // Generate the partition for the current dimension (column)
-            auto result = conn.Query("SELECT col" + std::to_string(d + 1) + " FROM " + inputRelation + " GROUP BY col" + std::to_string(d + 1) + " HAVING COUNT(*) > 1;");
-            if (result->RowCount() == 0) {
-                return;
+        for (int i = prevPartitionAtt + 1; i < attributeCount; i++) {
+            // Get common values of the partition attribute 
+            auto query = conn.Query("SELECT col" + std::to_string(i) + " FROM " + tblName + " GROUP BY col" + std::to_string(i) + " HAVING COUNT(*) > 1;");
+            if (query->RowCount() == 0) {
+                return; // Exit early if no common values
             }
 
-            // Get common values for current dimension
-            std::vector<std::string> commonVals;
-            for (size_t i = 0; i < result->RowCount(); i++) {
-                commonVals.push_back(result->GetValue(0, i).ToString());
+            std::vector<std::string> commonValues;
+            for (int j = 0; j < query->RowCount(); j++) {
+                commonValues.push_back(query->GetValue(0, j).ToString());
             }
 
-            // For each common value in the current attribute, recurse
-            for (const auto& val : commonVals) {
-                // Create a new AttributeSet by copying the current combination and adding the new dimension
-                AttributeSet newCombination = combination;
-                newCombination.insert(d);
+            // For each common value, partition on value and recurse 
+            AttributeSet nextAttSet = attSet;
+            nextAttSet.insert(i);
+            for (const auto& val : commonValues) {
+                std::string temp = "TEMP_" + std::to_string(strHasher(val)) + "_" + std::to_string(intHasher(i));
+                conn.Query(
+                    "CREATE TABLE " + temp + 
+                    " AS SELECT * EXCLUDE (col" + std::to_string(i) + 
+                    ") FROM " + tblName + 
+                    " WHERE col" + std::to_string(i) + " = '" + val + "';"
+                );
 
-                // Create temporary table for this partition
-                conn.Query("CREATE TEMPORARY TABLE " + temp + " AS SELECT * FROM " + inputRelation +
-                           " WHERE col" + std::to_string(d + 1) + " = '" + val + "';");
+                // Get count of distinct values 
+                auto cnt = conn.Query("SELECT COUNT(*) FROM " + temp + ";")->GetValue(0, 0).GetValue<int>();
+                entropies[nextAttSet] += (cnt * log2(cnt));
 
-                // Add this combination to the entropy map
-                double sumCntLog2 = calculateSumCntLog2(temp, newCombination);
-                double entropy = getLogN() - (sumCntLog2 / tupleCount);
-                entropies[newCombination] = entropy;
+                // Recurse
+                runBUC(temp, nextAttSet);
 
-                // Recursively call the next dimension
-                runBUC(temp, d + 1, newCombination);
-
-                // Drop the temporary table after recursion
                 conn.Query("DROP TABLE " + temp + ";");
             }
         }
     }
 
-    // Convert combination string into a vector of column indices (e.g., "val1-val2" -> {0, 1})
-    std::vector<int> getColumnsFromCombination(const std::string& combination) {
-        std::vector<int> columns;
-        size_t pos = 0;
-        size_t nextPos;
-        while ((nextPos = combination.find("-", pos)) != std::string::npos) {
-            columns.push_back(std::stoi(combination.substr(pos, nextPos - pos)) - 1);  // assuming val is 1-based
-            pos = nextPos + 1;
-        }
-        columns.push_back(std::stoi(combination.substr(pos)) - 1);  // add the last value
-        return columns;
-    }
-
     void computeEntropiesBUC() {
-        // Load CSV data into DuckDB table
-        std::string query = "CREATE TABLE data AS SELECT * FROM read_csv_auto('" + csvPath + "', names = [";
+        // Insert data 
+        std::string query = "CREATE TABLE data AS SELECT * FROM read_csv(" + csvPath + ", header=false, names=[";
         for (int i = 0; i < attributeCount; i++) {
             query += "'col" + std::to_string(i) + "'";
-            if (i != attributeCount - 1) query += ", ";
+            if (i != attributeCount - 1) {
+                query += ", ";
+            }
         }
         query += "]);";
         conn.Query(query);
 
-        // Count the total tuples (rows) in the data table
         tupleCount = conn.Query("SELECT COUNT(*) FROM data;")->GetValue(0, 0).GetValue<int>();
 
-        // Start recursive BUC algorithm
-        runBUC("data", 0, AttributeSet());
+        // Start
+        runBUC("data", {});
 
-        // Print computed entropies for all combinations
-        for (const auto& [attrSet, entropy] : entropies) {
-            std::cout << "Entropy for " << toString(attrSet) << ": " << entropy << "\n";
+        // Convert raw counts to entropies 
+        for (const auto& [attSet, entropy] : entropies) {
+            entropies[attSet] = getLogN() - (entropy / tupleCount);
         }
     }
 
@@ -335,10 +300,11 @@ public:
 
 int main() {
     SchemaMiner sm = SchemaMiner("small_flights.csv", 19);
-    // SchemaMiner sm = SchemaMiner("data.csv", 12);
+    // SchemaMiner sm = SchemaMiner("small.csv", 4);
 
     auto start = std::chrono::high_resolution_clock::now();
     sm.computeEntropiesBUC();
+    sm.printEntropies();
     auto end = std::chrono::high_resolution_clock::now();
     auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
 
