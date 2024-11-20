@@ -8,6 +8,7 @@
 #include <set>
 #include <vector>
 #include <chrono>
+#include <algorithm>
 
 // TODO: GetValue is apparently slow, rewrite to use Fetch
 
@@ -43,6 +44,9 @@ private:
     std::map<AttributeSet, double> entropies;
     std::map<std::string, double> entropyMap;
 
+    // Other 
+    std::map<int, int> attributeRenames;
+
     double getLogN() {
         return log2(tupleCount);
     }
@@ -51,6 +55,10 @@ public:
     SchemaMiner(std::string csvPath, int attributeCount) : db(nullptr), conn(db) {
         this->csvPath = csvPath;
         this->attributeCount = attributeCount;
+    }
+
+    void clearEntropies() {
+        entropies.clear();
     }
 
     std::string getTblName(const AttributeSet &attrSet) {
@@ -62,7 +70,7 @@ public:
         return name;
     }
 
-    void getFirstLevelEntropies() {
+    std::queue<std::pair<AttributeSet, int>> getFirstLevelEntropies() {
         // Open the CSV file
         std::ifstream file(csvPath);
         if (!file.is_open()) {
@@ -100,13 +108,15 @@ public:
 
         tupleCount = columns[0].size();
 
+        std::queue<std::pair<AttributeSet, int>> q;
+
         for (int i = 0; i < columns.size(); i++) {
             // Create TID table for column
             std::string tblName = getTblName({i});
             conn.Query("CREATE TABLE " + tblName + " (val VARCHAR(8), tid BIGINT);");
-            std::string valIdx = "CREATE INDEX val_idx ON " + tblName + "(val);";
+            std::string valIdx = "CREATE INDEX val_idx_" + tblName + " ON " + tblName + "(val);";
             conn.Query(valIdx);
-            std::string tidIdx = "CREATE INDEX tid_idx ON " + tblName + "(tid);";
+            std::string tidIdx = "CREATE INDEX tid_idx_" + tblName + " ON " + tblName + "(tid);";
             conn.Query(tidIdx);
 
             auto column = columns[i];
@@ -139,9 +149,17 @@ public:
             }
 
             // Compute entropy for single attribute
-            auto entropy = conn.Query("SELECT SUM(cnt) FROM (SELECT val, COUNT(*) * LOG2(COUNT(*)) AS cnt FROM " + tblName + " GROUP BY val) AS t;")->GetValue(0, 0).GetValue<double>();
-            entropies[{i}] = getLogN() - (entropy / tupleCount);
+            auto qry = conn.Query("SELECT SUM(cnt) FROM (SELECT val, COUNT(*) * LOG2(COUNT(*)) AS cnt FROM " + tblName + " GROUP BY val) AS t;");
+            try {
+                auto entropy = qry->GetValue(0, 0).GetValue<double>();
+                entropies[{i}] = getLogN() - (entropy / tupleCount);
+                q.push({{i}, i});
+            } catch (const std::exception& e) {
+                // Catch NULL returns when there are no common values
+                continue;
+            }
         }
+        return q;
     }
 
     int getEntropy(AttributeSet t1, AttributeSet t2) {
@@ -189,12 +207,8 @@ public:
     }
 
     void computeEntropiesTIDCNT() {
-        getFirstLevelEntropies();
-        
-        std::queue<std::pair<AttributeSet, int>> q;
-        for (int i = 0; i < attributeCount; i++) {
-            q.push({{i}, i});
-        }
+        std::queue<std::pair<AttributeSet, int>> q = getFirstLevelEntropies();
+    
 
         while (!q.empty()) {
             auto [attSet, last] = q.front();
@@ -227,35 +241,59 @@ public:
     }
 
     void runBUC(const std::string& tblName, AttributeSet attSet) {
+        // std::cout << "Running BUC on table: " << tblName << " with attributes: " << toString(attSet) << std::endl;
+
         // Iterate through possible partitionAtts remaining 
         int prevPartitionAtt = attSet.empty() ? -1 : *attSet.rbegin(); 
 
         for (int i = prevPartitionAtt + 1; i < attributeCount; i++) {
+            // std::cout << "Partitioning on attribute: " << i << '\n';
+            AttributeSet nextAttSet = attSet;
+            nextAttSet.insert(i);
+            
+            // If we're at the last attribute, just count rather than partition
+            if (i == attributeCount-1) {
+                auto qry = conn.Query("SELECT SUM(cnt) FROM (SELECT col" + std::to_string(i) + ", COUNT(*) * LOG2(COUNT(*)) AS cnt FROM " + tblName + " GROUP BY col" + std::to_string(i) + " HAVING COUNT(*) > 1) AS t;");
+                try {
+                    auto cnt = qry->GetValue(0, 0).GetValue<double>();
+                    entropies[nextAttSet] += cnt;
+                } catch (const std::exception& e) {
+                    // Catch NULL returns when there are no common values
+                    continue;
+                }
+                return;
+            }
+            
             // Get common values of the partition attribute 
             auto query = conn.Query("SELECT col" + std::to_string(i) + " FROM " + tblName + " GROUP BY col" + std::to_string(i) + " HAVING COUNT(*) > 1;");
             if (query->RowCount() == 0) {
-                return; // Exit early if no common values
+                // std::cout << "No common values found for attribute: " << i << "\n";
+                continue; // Exit early if no common values
             }
 
             std::vector<std::string> commonValues;
+            // std::cout << "Common values for attribute " << i << ": ";
             for (int j = 0; j < query->RowCount(); j++) {
+                // std::cout << query->GetValue(0, j).ToString() << " ";
                 commonValues.push_back(query->GetValue(0, j).ToString());
             }
+            // std::cout << '\n';
 
             // For each common value, partition on value and recurse 
-            AttributeSet nextAttSet = attSet;
-            nextAttSet.insert(i);
             for (const auto& val : commonValues) {
                 std::string temp = "TEMP_" + std::to_string(strHasher(val)) + "_" + std::to_string(intHasher(i));
+                // std::cout << "Creating temporary table: " << temp << " for value: " << val << '\n';
                 conn.Query(
                     "CREATE TABLE " + temp + 
                     " AS SELECT * EXCLUDE (col" + std::to_string(i) + 
                     ") FROM " + tblName + 
                     " WHERE col" + std::to_string(i) + " = '" + val + "';"
                 );
+                // conn.Query("SELECT * FROM " + temp + ";")->Print();
 
                 // Get count of distinct values 
                 auto cnt = conn.Query("SELECT COUNT(*) FROM " + temp + ";")->GetValue(0, 0).GetValue<int>();
+                // std::cout << "Adding count: " << (cnt * log2(cnt)) << " to entropy of " << toString(nextAttSet) << '\n';
                 entropies[nextAttSet] += (cnt * log2(cnt));
 
                 // Recurse
@@ -280,6 +318,28 @@ public:
 
         tupleCount = conn.Query("SELECT COUNT(*) FROM data;")->GetValue(0, 0).GetValue<int>();
 
+        // Order columns from most distinct to least ---------------------------
+        std::vector<std::pair<int, int>> colCounts = {};
+        for (int i = 0; i < attributeCount; i++) {
+            colCounts.push_back({i, conn.Query("SELECT COUNT(DISTINCT col" + std::to_string(i) + ") FROM data;")->GetValue(0, 0).GetValue<int>()});
+        }
+    
+        std::sort(colCounts.begin(), colCounts.end(), [](const std::pair<int, int>& a, const std::pair<int, int>& b) {
+            return a.second > b.second; // Compare the second elem (distinct count)
+        });
+
+        // Temporarily rename columns 
+        for (int i = 0; i < attributeCount; i++) {
+            conn.Query("ALTER TABLE data RENAME COLUMN col" + std::to_string(i) + " TO temp_col" + std::to_string(i) + ";");
+        }
+
+        // Reorder
+        for (int i = 0; i < attributeCount; i++) {
+            conn.Query("ALTER TABLE data RENAME COLUMN temp_col" + std::to_string(colCounts[i].first) + " TO col" + std::to_string(i) + ";"); 
+            attributeRenames[colCounts[i].first] = i;
+        }
+
+
         // Start
         runBUC("data", {});
 
@@ -287,6 +347,17 @@ public:
         for (const auto& [attSet, entropy] : entropies) {
             entropies[attSet] = getLogN() - (entropy / tupleCount);
         }
+
+        // Reorder attribute combinations 
+        std::map<AttributeSet, double> newEntropies;
+        for (const auto& [attSet, entropy] : entropies) {
+            AttributeSet newAttSet;
+            for (const auto& att : attSet) {
+                newAttSet.insert(attributeRenames[att]);
+            }
+            newEntropies[newAttSet] = entropy;
+        }
+        entropies = newEntropies;
     }
 
     void printEntropies() {
@@ -300,13 +371,22 @@ public:
 
 int main() {
     SchemaMiner sm = SchemaMiner("small_flights.csv", 19);
-    // SchemaMiner sm = SchemaMiner("small.csv", 4);
 
     auto start = std::chrono::high_resolution_clock::now();
-    sm.computeEntropiesBUC();
+    sm.computeEntropiesTIDCNT();
     sm.printEntropies();
     auto end = std::chrono::high_resolution_clock::now();
     auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
 
+    std::cout << "Time taken (TID/CNT): " << duration.count() << "ms\n";
+
+    sm.clearEntropies();
+
+    start = std::chrono::high_resolution_clock::now();
+    sm.computeEntropiesBUC();
+    sm.printEntropies();
+    end = std::chrono::high_resolution_clock::now();
+    duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
     std::cout << "Time taken (BUC): " << duration.count() << "ms\n";
 }
+
