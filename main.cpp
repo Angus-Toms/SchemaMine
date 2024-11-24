@@ -336,7 +336,8 @@ public:
         // Reorder
         for (int i = 0; i < attributeCount; i++) {
             conn.Query("ALTER TABLE data RENAME COLUMN temp_col" + std::to_string(colCounts[i].first) + " TO col" + std::to_string(i) + ";"); 
-            attributeRenames[colCounts[i].first] = i;
+            // attributeRenames[colCounts[i].first] = i;
+            attributeRenames[i] = colCounts[i].first;
         }
 
 
@@ -360,6 +361,22 @@ public:
         entropies = newEntropies;
     }
 
+    void computeEntropiesTDC() {
+                std::string query = "CREATE TABLE data AS SELECT * FROM read_csv(" + csvPath + ", header=false, names=[";
+        for (int i = 0; i < attributeCount; i++) {
+            query += "'col" + std::to_string(i) + "'";
+            if (i != attributeCount - 1) {
+                query += ", ";
+            }
+        }
+        query += "]);";
+        conn.Query(query);
+
+        tupleCount = conn.Query("SELECT COUNT(*) FROM data;")->GetValue(0, 0).GetValue<int>();
+
+        conn.Query("SELECT col0, col1, col2, COUNT(*) FROM data GROUP BY ROLLUP(col0, col1, col2) HAVING COUNT(*) > 1;")->Print();
+    }
+
     void printEntropies() {
         for (const auto& [attSet, entropy] : entropies) {
             std::cout << "Entropy for ";
@@ -370,23 +387,36 @@ public:
 };
 
 int main() {
-    SchemaMiner sm = SchemaMiner("small_flights.csv", 19);
+    SchemaMiner sm = SchemaMiner("credit_card.csv", 23);
+
+    // auto start = std::chrono::high_resolution_clock::now();
+    // sm.computeEntropiesTDC();
+    // auto end = std::chrono::high_resolution_clock::now();
+    // auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
+    // std::cout << "Time taken (TDC): " << duration.count() << "ms\n";
+
+    // sm.computeEntropiesCUBE();
+    // sm.printEntropies();
+    // auto end = std::chrono::high_resolution_clock::now();
+    // auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
+    // std::cout << "Time taken (CUBE): " << duration.count() << "ms\n";
+
+    // sm.clearEntropies();
 
     auto start = std::chrono::high_resolution_clock::now();
     sm.computeEntropiesTIDCNT();
-    sm.printEntropies();
+    // sm.printEntropies();
     auto end = std::chrono::high_resolution_clock::now();
-    auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
-
-    std::cout << "Time taken (TID/CNT): " << duration.count() << "ms\n";
+    auto duration = std::chrono::duration_cast<std::chrono::seconds>(end - start);
+    std::cout << "Time taken (TID/CNT): " << duration.count() << "s\n";
 
     sm.clearEntropies();
 
     start = std::chrono::high_resolution_clock::now();
     sm.computeEntropiesBUC();
-    sm.printEntropies();
+    // sm.printEntropies();
     end = std::chrono::high_resolution_clock::now();
-    duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
+    duration = std::chrono::duration_cast<std::chrono::seconds>(end - start);
     std::cout << "Time taken (BUC): " << duration.count() << "ms\n";
 }
 
