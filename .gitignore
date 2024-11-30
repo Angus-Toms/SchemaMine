@@ -1,4 +1,7 @@
 build/
 datasets/
-TODO.md
 .vscode/
+
+TODO.md
+*.numbers
+*.py

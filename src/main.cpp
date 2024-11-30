@@ -322,6 +322,85 @@ public:
     }
 };
 
+class SchemaMinerSimple : public SchemaMiner {
+private:
+    bool computeEntropy(const AttributeSet& attSet) {
+        std::string qry;
+        if (attSet.empty()) {
+            qry = "SELECT COUNT(*) * LOG2(COUNT(*)) FROM data;";
+        } else {
+            qry = "SELECT SUM(cnt) FROM (SELECT COUNT(*) * LOG2(COUNT(*)) AS cnt FROM data GROUP BY ";
+            for (const auto& att : attSet) {
+                qry += "col" + std::to_string(att) + ", ";
+            }
+            qry.pop_back(); // Remove trailing comma and space
+            qry.pop_back();
+            qry += " HAVING COUNT(*) > 1) AS t;";
+        }
+
+        try {
+            auto cnt = conn.Query(qry)->GetValue(0, 0).GetValue<double>();
+            entropies[attSet] = getLogN() - (cnt / tupleCount);
+            return true;
+        } catch (const std::exception&) {
+            return false; // Failure, prune this branch
+        }
+    }
+
+    void recurseAttSets(int limit, int start, AttributeSet currSet) {
+        if (!computeEntropy(currSet)) {
+            return;
+        }
+        for (int i = start; i < limit;  ++i) {
+            currSet.insert(i);
+            recurseAttSets(limit, i + 1, currSet);
+            currSet.erase(i);
+        }
+    }
+
+public:
+    SchemaMinerSimple(const std::string& csvPath, int attributeCount) : SchemaMiner(csvPath, attributeCount) {}
+
+    void computeEntropies() override {
+        // Insert data 
+        std::string query = "CREATE TABLE data AS SELECT * FROM read_csv('" + csvPath + "', header=false, names=[";
+        for (int i = 0; i < attributeCount; i++) {
+            query += "'col" + std::to_string(i) + "'";
+            if (i != attributeCount - 1) {
+                query += ", ";
+            }
+        }
+        query += "]);";
+        conn.Query(query);
+
+        tupleCount = conn.Query("SELECT COUNT(*) FROM data;")->GetValue(0, 0).GetValue<int>();
+
+        recurseAttSets(attributeCount, 0, {});
+    }
+
+};
+
 int main() {
+    SchemaMinerSimple simple("datasets/restaurant.csv", 12);
+    auto start = std::chrono::high_resolution_clock::now();
+    simple.computeEntropies();
+    auto end = std::chrono::high_resolution_clock::now();
+    simple.printEntropies();
+    std::cout << "Time taken (Simple): " << std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count() << "ms\n";
+
+    SchemaMinerTIDCNT tid("datasets/restaurant.csv", 12);
+    start = std::chrono::high_resolution_clock::now();
+    tid.computeEntropies();
+    end = std::chrono::high_resolution_clock::now();
+    tid.printEntropies();
+    std::cout << "Time taken (TID/CNT): " << std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count() << "ms\n";
+
+    // SchemaMinerBUC buc("datasets/small.csv", 4);
+    // start = std::chrono::high_resolution_clock::now();
+    // buc.computeEntropies();
+    // end = std::chrono::high_resolution_clock::now();
+    // buc.printEntropies();
+    // std::cout << "Time taken (BUC): " << std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count() << "ms\n";
+
     return 0;
 }
